@@ -1,29 +1,57 @@
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import requests
 import re
-import json
 import os
 import codecs
 import time
 import random
 from urllib.parse import urlparse, parse_qs
 import tempfile
-from werkzeug.utils import secure_filename
+from collections import defaultdict
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
+
+# Production configuration
+if os.environ.get('FLASK_ENV') == 'production':
+    app.config['DEBUG'] = False
+else:
+    app.config['DEBUG'] = True
+
+# Simple rate limiting
+request_counts = defaultdict(list)
+
+def rate_limit_check(ip, limit=10, window=60):
+    """Simple rate limiting: 10 requests per minute per IP"""
+    now = time.time()
+    request_counts[ip] = [req_time for req_time in request_counts[ip] if now - req_time < window]
+    
+    if len(request_counts[ip]) >= limit:
+        return False
+    
+    request_counts[ip].append(now)
+    return True
+
+@app.before_request
+def limit_remote_addr():
+    """Apply rate limiting to extract endpoint"""
+    if request.endpoint == 'extract_video_info':
+        client_ip = request.environ.get('HTTP_X_REAL_IP', request.remote_addr)
+        if not rate_limit_check(client_ip):
+            return jsonify({'error': 'Rate limit exceeded. Try again later.'}), 429
 
 def clean_description(raw_description):
-    """
-    Clean and format the YouTube description text for better readability
-    """
+    """Clean and format the YouTube description text for better readability"""
     try:
         description = raw_description
         
-        # Handle JSON-escaped unicode sequences first
+        # Handle JSON-escaped unicode sequences
         try:
-            # Decode JSON escape sequences like \u0000
             description = codecs.decode(description, 'unicode_escape')
         except (UnicodeDecodeError, UnicodeEncodeError):
             pass
@@ -46,20 +74,13 @@ def clean_description(raw_description):
             except (UnicodeDecodeError, UnicodeEncodeError):
                 description = ''.join(char for char in description if ord(char) < 128)
         
-        # Clean up whitespace while preserving intentional formatting
+        # Clean up whitespace while preserving formatting
         lines = description.split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            cleaned_line = line.strip()
-            cleaned_lines.append(cleaned_line)
-        
+        cleaned_lines = [line.strip() for line in lines]
         description = '\n'.join(cleaned_lines)
-        
-        # Remove excessive consecutive newlines (more than 2)
         description = re.sub(r'\n{3,}', '\n\n', description)
         
-        # Final cleanup - ensure it's valid UTF-8
+        # Final UTF-8 cleanup
         try:
             description = description.encode('utf-8').decode('utf-8')
         except UnicodeError:
@@ -72,63 +93,37 @@ def clean_description(raw_description):
         return description.strip()
         
     except Exception as e:
-        print(f"Error in clean_description: {str(e)}")
+        logging.error(f"Error in clean_description: {str(e)}")
         return f"Error cleaning description: {str(e)}"
 
-def get_youtube_info(url):
-    """
-    Get YouTube video title and description from any YouTube URL
-    Enhanced version with better detection and alternative methods
-    """
+def get_video_id_from_url(video_url):
+    """Extract video ID from YouTube URL"""
     try:
-        # Try multiple approaches in order
-        methods = [
-            lambda: get_youtube_info_method1(url),
-            lambda: get_youtube_info_method2(url),
-            lambda: get_youtube_info_method3(url)
-        ]
-        
-        for i, method in enumerate(methods):
-            try:
-                result = method()
-                if (result['title'] not in ['Title not found', 'Error'] and 
-                    result['description'] not in ['Description not found', 'Error']):
-                    print(f"Success with method {i+1}")
-                    return result
-                elif result['title'] not in ['Title not found', 'Error']:
-                    print(f"Partial success with method {i+1} (title only)")
-                    for j, method2 in enumerate(methods[i+1:], i+1):
-                        try:
-                            result2 = method2()
-                            if result2['description'] not in ['Description not found', 'Error']:
-                                return {
-                                    'title': result['title'],
-                                    'description': result2['description']
-                                }
-                        except:
-                            continue
-                    return result
-            except Exception as e:
-                print(f"Method {i+1} failed: {str(e)}")
-                continue
-        
-        return {
-            'title': "All extraction methods failed",
-            'description': "Could not extract video information"
-        }
-        
+        parsed = urlparse(video_url)
+        video_id = None
+
+        if parsed.hostname in ("youtu.be",):
+            video_id = parsed.path[1:]
+        elif parsed.hostname in ("www.youtube.com", "youtube.com"):
+            if "/watch" in parsed.path:
+                qs = parse_qs(parsed.query)
+                video_id = qs.get("v", [None])[0]
+            elif "/embed/" in parsed.path:
+                video_id = parsed.path.split("/embed/")[1].split("?")[0]
+            elif "/v/" in parsed.path:
+                video_id = parsed.path.split("/v/")[1].split("?")[0]
+
+        if video_id:
+            video_id = video_id.split("&")[0].split("?")[0]
+            
+        return video_id
     except Exception as e:
-        print(f"Error in get_youtube_info: {str(e)}")
-        return {
-            'title': f"Error: {str(e)}",
-            'description': f"Error: {str(e)}"
-        }
+        logging.error(f"Error extracting video ID: {str(e)}")
+        return None
 
 def get_youtube_info_method1(url):
-    """Method 1: Standard web scraping with enhanced patterns"""
+    """Method 1: Standard web scraping"""
     time.sleep(random.uniform(0.5, 2))
-    
-    session = requests.Session()
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -139,11 +134,9 @@ def get_youtube_info_method1(url):
         'DNT': '1'
     }
     
-    response = session.get(url, headers=headers, timeout=15)
+    response = requests.get(url, headers=headers, timeout=15)
     response.raise_for_status()
-    
     content = response.text
-    print(f"Method 1 - Content length: {len(content)}")
     
     if "unusual traffic" in content.lower() or len(content) < 1000:
         raise Exception("Request appears to be blocked")
@@ -183,20 +176,17 @@ def get_youtube_info_method1(url):
     return {'title': title, 'description': description}
 
 def get_youtube_info_method2(url):
-    """Method 2: Mobile YouTube approach"""
+    """Method 2: Mobile approach"""
     time.sleep(random.uniform(0.5, 2))
     
     mobile_url = url.replace('www.youtube.com', 'm.youtube.com')
-    
     headers = {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
     }
     
     response = requests.get(mobile_url, headers=headers, timeout=15)
     response.raise_for_status()
-    
     content = response.text
-    print(f"Method 2 - Mobile content length: {len(content)}")
     
     title_patterns = [
         r'<title[^>]*>([^<]+)</title>',
@@ -230,7 +220,7 @@ def get_youtube_info_method2(url):
     return {'title': title, 'description': description}
 
 def get_youtube_info_method3(url):
-    """Method 3: Alternative approach using different endpoints"""
+    """Method 3: Alternative endpoints"""
     try:
         video_id = get_video_id_from_url(url)
         if not video_id:
@@ -238,11 +228,9 @@ def get_youtube_info_method3(url):
         
         time.sleep(random.uniform(0.5, 2))
         
+        # Try oembed endpoint
         oembed_url = f"https://www.youtube.com/oembed?url={url}&format=json"
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (compatible; YTInfoExtractor/1.0)'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0 (compatible; YTInfoExtractor/1.0)'}
         
         try:
             response = requests.get(oembed_url, headers=headers, timeout=10)
@@ -250,17 +238,18 @@ def get_youtube_info_method3(url):
                 data = response.json()
                 title = data.get('title', 'Title not found')
                 
+                # Get description from main page
                 main_response = requests.get(url, headers=headers, timeout=10)
                 desc_match = re.search(r'"shortDescription":"((?:[^"\\]|\\.)*)(?<!\\)"', main_response.text)
                 description = "Description not found"
                 if desc_match:
                     description = clean_description(desc_match.group(1))
                 
-                print(f"Method 3 - oEmbed success")
                 return {'title': title, 'description': description}
         except:
             pass
         
+        # Fallback
         simple_headers = {'User-Agent': 'curl/7.68.0'}
         response = requests.get(url, headers=simple_headers, timeout=15)
         content = response.text
@@ -275,17 +264,49 @@ def get_youtube_info_method3(url):
         if desc_match:
             description = clean_description(desc_match.group(1))
         
-        print(f"Method 3 - Simple extraction")
         return {'title': title, 'description': description}
         
     except Exception as e:
-        print(f"Method 3 error: {str(e)}")
+        logging.error(f"Method 3 error: {str(e)}")
         return {'title': "Title not found", 'description': "Description not found"}
 
+def get_youtube_info(url):
+    """Get YouTube video info using multiple methods"""
+    try:
+        methods = [
+            lambda: get_youtube_info_method1(url),
+            lambda: get_youtube_info_method2(url),
+            lambda: get_youtube_info_method3(url)
+        ]
+        
+        for i, method in enumerate(methods):
+            try:
+                result = method()
+                if (result['title'] not in ['Title not found', 'Error'] and 
+                    result['description'] not in ['Description not found', 'Error']):
+                    logging.info(f"Success with method {i+1}")
+                    return result
+                elif result['title'] not in ['Title not found', 'Error']:
+                    logging.info(f"Partial success with method {i+1}")
+                    return result
+            except Exception as e:
+                logging.error(f"Method {i+1} failed: {str(e)}")
+                continue
+        
+        return {
+            'title': "All extraction methods failed",
+            'description': "Could not extract video information"
+        }
+        
+    except Exception as e:
+        logging.error(f"Error in get_youtube_info: {str(e)}")
+        return {
+            'title': f"Error: {str(e)}",
+            'description': f"Error: {str(e)}"
+        }
+
 def get_youtube_tags(video_url):
-    """
-    Extract YouTube video tags from the video page
-    """
+    """Extract YouTube video tags"""
     try:
         time.sleep(random.uniform(0.5, 1.5))
         
@@ -303,7 +324,6 @@ def get_youtube_tags(video_url):
         ]
         
         all_tags = []
-        
         for pattern in tag_patterns:
             keywords_match = re.search(pattern, response.text)
             if keywords_match:
@@ -311,6 +331,7 @@ def get_youtube_tags(video_url):
                 tags = re.findall(r'"([^"]*)"', keywords_str)
                 all_tags.extend(tags)
         
+        # Remove duplicates
         seen = set()
         unique_tags = []
         for tag in all_tags:
@@ -321,44 +342,18 @@ def get_youtube_tags(video_url):
         return unique_tags[:20]
         
     except Exception as e:
-        print(f"Error extracting tags: {str(e)}")
+        logging.error(f"Error extracting tags: {str(e)}")
         return []
-
-def get_video_id_from_url(video_url):
-    """Extract video ID from YouTube URL"""
-    try:
-        parsed = urlparse(video_url)
-        video_id = None
-
-        if parsed.hostname in ("youtu.be",):
-            video_id = parsed.path[1:]
-        elif parsed.hostname in ("www.youtube.com", "youtube.com"):
-            if "/watch" in parsed.path:
-                qs = parse_qs(parsed.query)
-                video_id = qs.get("v", [None])[0]
-            elif "/embed/" in parsed.path:
-                video_id = parsed.path.split("/embed/")[1].split("?")[0]
-            elif "/v/" in parsed.path:
-                video_id = parsed.path.split("/v/")[1].split("?")[0]
-
-        if video_id:
-            video_id = video_id.split("&")[0].split("?")[0]
-            
-        return video_id
-    except Exception as e:
-        print(f"Error extracting video ID: {str(e)}")
-        return None
-
-@app.route('/')
-def index():
-    """Serve the main HTML page"""
-    return render_template('index.html')
 
 @app.route('/api/extract', methods=['POST'])
 def extract_video_info():
-    """API endpoint to extract YouTube video information"""
+    """Extract YouTube video information"""
     try:
         data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'Invalid JSON data'}), 400
+            
         video_url = data.get('url')
         
         if not video_url:
@@ -367,13 +362,14 @@ def extract_video_info():
         if not ('youtube.com' in video_url or 'youtu.be' in video_url):
             return jsonify({'error': 'Invalid YouTube URL'}), 400
         
-        print(f"Extracting info for URL: {video_url}")
+        logging.info(f"Extracting info for URL: {video_url}")
         
+        # Get video information
         info = get_youtube_info(video_url)
         tags = get_youtube_tags(video_url)
-        
         video_id = get_video_id_from_url(video_url)
         
+        # Get thumbnail URL
         thumbnail_urls = [
             f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
             f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
@@ -399,16 +395,16 @@ def extract_video_info():
             'video_id': video_id
         }
         
-        print(f"Extraction completed. Title: {info['title'][:50]}...")
+        logging.info(f"Extraction completed for: {info['title'][:50]}...")
         return jsonify(result)
         
     except Exception as e:
-        print(f"API Error: {str(e)}")
+        logging.error(f"API Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/download-thumbnail/<video_id>')
 def download_thumbnail(video_id):
-    """API endpoint to download thumbnail"""
+    """Download thumbnail image"""
     try:
         thumbnail_urls = [
             f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
@@ -432,7 +428,7 @@ def download_thumbnail(video_id):
                         mimetype='image/jpeg'
                     )
             except Exception as e:
-                print(f"Error downloading thumbnail from {thumbnail_url}: {str(e)}")
+                logging.error(f"Error downloading from {thumbnail_url}: {str(e)}")
                 continue
         
         return jsonify({'error': 'Thumbnail not found'}), 404
@@ -443,17 +439,30 @@ def download_thumbnail(video_id):
 @app.route('/health')
 def health_check():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'message': 'YouTube Info Extractor is running'})
+    return jsonify({
+        'status': 'healthy',
+        'message': 'YouTube Info Extractor API is running'
+    })
 
-# Get port from environment variable or default to 5000
-port = int(os.environ.get('PORT', 5000))
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
-    print("Starting YouTube Info Extractor...")
-    print("Available endpoints:")
-    print("  GET  / - Main interface")
+    port = int(os.environ.get('PORT', 5000))
+    debug_mode = not os.environ.get('FLASK_ENV') == 'production'
+    
+    print("🚀 YouTube Info Extractor API Starting...")
+    print(f"📍 Port: {port}")
+    print(f"🔧 Debug: {debug_mode}")
+    print("\n📋 API Endpoints:")
     print("  POST /api/extract - Extract video info")
     print("  GET  /api/download-thumbnail/<video_id> - Download thumbnail")
     print("  GET  /health - Health check")
+    print("=" * 50)
     
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(debug=debug_mode, host='0.0.0.0', port=port)
